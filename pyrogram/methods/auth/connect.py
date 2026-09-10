@@ -49,4 +49,15 @@ class Connect:
 
         self.is_connected = True
 
+        user_id = await self.storage.user_id()
+        if not user_id and await self.storage.auth_key():
+            try:
+                me = await self.get_me()
+                if me:
+                    await self.storage.user_id(me.id)
+                    await self.storage.is_bot(me.is_bot)
+                    return True
+            except Exception:
+                pass
+
         return bool(await self.storage.user_id())

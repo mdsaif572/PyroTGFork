@@ -59,6 +59,11 @@ class Start:
 
         try:
             if not is_authorized:
+                if self.session_string:
+                    raise ValueError(
+                        "The provided session_string is not authorized, expired, or invalid. "
+                        "Interactive login is disabled when session_string is provided."
+                    )
                 await self.authorize()
 
             if self.takeout and not await self.storage.is_bot():
