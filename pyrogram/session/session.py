@@ -155,27 +155,50 @@ class Session:
                 await self.send(raw.functions.Ping(ping_id=0), timeout=self.START_TIMEOUT)
 
                 if not self.is_cdn:
-                    await self.send(
-                        raw.functions.InvokeWithLayer(
-                            layer=layer,
-                            query=raw.functions.InitConnection(
-                                api_id=await self.client.storage.api_id(),
-                                app_version=self.client.app_version,
-                                device_model=self.client.device_model,
-                                system_version=self.client.system_version,
-                                system_lang_code=self.client.lang_code,
-                                lang_code=self.client.lang_code,
-                                lang_pack="",  # "langPacks are for official apps only"
-                                query=raw.functions.help.GetConfig(),
-                                proxy=raw.types.InputClientProxy(
-                                    address=self.client._un_docu_gnihts[0],
-                                    port=self.client._un_docu_gnihts[1],
-                                ) if len(self.client._un_docu_gnihts) == 3 else None,
-                                params=self.client._un_docu_gnihts[2] if len(self.client._un_docu_gnihts) == 3 else None
-                            )
-                        ),
-                        timeout=self.START_TIMEOUT
+                    init_query = raw.functions.InitConnection(
+                        api_id=await self.client.storage.api_id() or self.client.api_id,
+                        app_version=self.client.app_version,
+                        device_model=self.client.device_model,
+                        system_version=self.client.system_version,
+                        system_lang_code=self.client.lang_code,
+                        lang_code=self.client.lang_code,
+                        lang_pack="",  # "langPacks are for official apps only"
+                        query=raw.functions.help.GetConfig(),
+                        proxy=raw.types.InputClientProxy(
+                            address=self.client._un_docu_gnihts[0],
+                            port=self.client._un_docu_gnihts[1],
+                        ) if len(self.client._un_docu_gnihts) == 3 else None,
+                        params=self.client._un_docu_gnihts[2] if len(self.client._un_docu_gnihts) == 3 else None
                     )
+
+                    try:
+                        await self.send(
+                            raw.functions.InvokeWithLayer(
+                                layer=layer,
+                                query=init_query
+                            ),
+                            timeout=self.START_TIMEOUT
+                        )
+                    except RPCError as e:
+                        err_id = getattr(e, "ID", "") or str(e)
+                        if "CONNECTION_LAYER_INVALID" in err_id:
+                            for fallback_layer in (195, 184, 175):
+                                try:
+                                    log.warning(f"Layer {layer} rejected. Retrying with layer {fallback_layer}...")
+                                    await self.send(
+                                        raw.functions.InvokeWithLayer(
+                                            layer=fallback_layer,
+                                            query=init_query
+                                        ),
+                                        timeout=self.START_TIMEOUT
+                                    )
+                                    break
+                                except RPCError as e2:
+                                    if "CONNECTION_LAYER_INVALID" in (getattr(e2, "ID", "") or str(e2)):
+                                        continue
+                                    raise e2
+                        else:
+                            raise e
 
                 self.ping_task = self.client.loop.create_task(self.ping_worker())
 
