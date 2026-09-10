@@ -21,25 +21,33 @@ import logging
 log = logging.getLogger(__name__)
 
 try:
-    import tgcrypto
+    import warpcrypto as _crypto
 
-    log.info("Using TgCrypto")
+    log.info("Using WarpCrypto")
+except ImportError:
+    try:
+        import tgcrypto as _crypto
 
+        log.info("Using TgCrypto")
+    except ImportError:
+        _crypto = None
+
+if _crypto is not None:
 
     def ige256_encrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
-        return tgcrypto.ige256_encrypt(data, key, iv)
+        return _crypto.ige256_encrypt(data, key, iv)
 
 
     def ige256_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
-        return tgcrypto.ige256_decrypt(data, key, iv)
+        return _crypto.ige256_decrypt(data, key, iv)
 
 
     def ctr256_encrypt(data: bytes, key: bytes, iv: bytearray, state: bytearray = None) -> bytes:
-        return tgcrypto.ctr256_encrypt(data, key, iv, state or bytearray(1))
+        return _crypto.ctr256_encrypt(data, key, iv, state or bytearray(1))
 
 
     def ctr256_decrypt(data: bytes, key: bytes, iv: bytearray, state: bytearray = None) -> bytes:
-        return tgcrypto.ctr256_decrypt(data, key, iv, state or bytearray(1))
+        return _crypto.ctr256_decrypt(data, key, iv, state or bytearray(1))
 
 
     def xor(a: bytes, b: bytes) -> bytes:
@@ -48,11 +56,11 @@ try:
             len(a),
             "big",
         )
-except ImportError:
+else:
     import pyaes
 
     log.warning(
-        "TgCrypto is missing! "
+        "Neither WarpCrypto nor TgCrypto is available! "
         "Pyrogram will work the same, but at a much slower speed. "
         "More info: https://telegramplayground.github.io/pyrogram/topics/speedups"
     )

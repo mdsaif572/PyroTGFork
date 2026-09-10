@@ -29,10 +29,10 @@ class MsgFactory:
     def __init__(self):
         self.seq_no = SeqNo()
 
-    def __call__(self, body: TLObject) -> Message:
+    def __call__(self, body: TLObject, length: int = None) -> Message:
         return Message(
             body,
             MsgId(),
             self.seq_no(not isinstance(body, not_content_related)),
-            len(body)
+            length if length is not None else len(body)
         )

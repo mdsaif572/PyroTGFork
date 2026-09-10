@@ -40,6 +40,32 @@ from .internals import MsgId, MsgFactory
 log = logging.getLogger(__name__)
 
 
+def _upload_part_length(data: TLObject):
+    """Serialized length of an upload part without serializing it.
+
+    upload.SaveFilePart and upload.SaveBigFilePart have a fixed layout and
+    are the whole upload hot path: MsgFactory would otherwise call
+    ``data.write()`` (a full 512 KiB BytesIO round-trip) just to measure the
+    length, and then Session.send -> mtproto.pack would serialize the same
+    part a second time. Computing the fixed header plus the TL-serialized
+    ``bytes`` field length skips the first of those two copies.
+    Returns None for any other object.
+    """
+    if isinstance(data, raw.functions.upload.SaveBigFilePart):
+        header = 20  # ID (4) + file_id (8) + file_part (4) + file_total_parts (4)
+    elif isinstance(data, raw.functions.upload.SaveFilePart):
+        header = 16  # ID (4) + file_id (8) + file_part (4)
+    else:
+        return None
+
+    length = len(data.bytes)
+
+    if length > 253:
+        return header + 4 + length + -length % 4
+
+    return header + 1 + length + -(length + 1) % 4
+
+
 class Result:
     def __init__(self):
         self.value = None
@@ -338,7 +364,7 @@ class Session:
         wait_response: bool = True,
         timeout: float = WAIT_TIMEOUT
     ):
-        message = self.msg_factory(data)
+        message = self.msg_factory(data, _upload_part_length(data))
         msg_id = message.msg_id
 
         if wait_response:

@@ -136,8 +136,11 @@ class SaveFile:
 
         file_total_parts = int(math.ceil(file_size / part_size))
         is_big = file_size > 10 * 1024 * 1024
-        pool_size = 3 if is_big else 1
-        workers_count = 4 if is_big else 1
+        # 5 sessions x 2 workers, like wzgram's bot defaults: spreading parts
+        # over more connections keeps each one fed on a fast link.
+        # Override with PYROTGFORK_UPLOAD_POOL / PYROTGFORK_UPLOAD_WORKERS.
+        pool_size = int(os.environ.get("PYROTGFORK_UPLOAD_POOL", 5)) if is_big else 1
+        workers_count = int(os.environ.get("PYROTGFORK_UPLOAD_WORKERS", 2)) if is_big else 1
         is_missing_part = file_id is not None
         file_id = file_id or self.rnd_id()
         md5_sum = md5() if not is_big and not is_missing_part else None
