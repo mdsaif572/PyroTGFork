@@ -171,34 +171,13 @@ class Session:
                         params=self.client._un_docu_gnihts[2] if len(self.client._un_docu_gnihts) == 3 else None
                     )
 
-                    try:
-                        await self.send(
-                            raw.functions.InvokeWithLayer(
-                                layer=layer,
-                                query=init_query
-                            ),
-                            timeout=self.START_TIMEOUT
-                        )
-                    except RPCError as e:
-                        err_id = getattr(e, "ID", "") or str(e)
-                        if "CONNECTION_LAYER_INVALID" in err_id:
-                            for fallback_layer in (195, 184, 175):
-                                try:
-                                    log.warning(f"Layer {layer} rejected. Retrying with layer {fallback_layer}...")
-                                    await self.send(
-                                        raw.functions.InvokeWithLayer(
-                                            layer=fallback_layer,
-                                            query=init_query
-                                        ),
-                                        timeout=self.START_TIMEOUT
-                                    )
-                                    break
-                                except RPCError as e2:
-                                    if "CONNECTION_LAYER_INVALID" in (getattr(e2, "ID", "") or str(e2)):
-                                        continue
-                                    raise e2
-                        else:
-                            raise e
+                    await self.send(
+                        raw.functions.InvokeWithLayer(
+                            layer=layer,
+                            query=init_query
+                        ),
+                        timeout=self.START_TIMEOUT
+                    )
 
                 self.ping_task = self.client.loop.create_task(self.ping_worker())
 
@@ -277,6 +256,9 @@ class Session:
                     self.auth_key_id,
                 )
         except SecurityCheckMismatch:
+            return
+        except Exception as e:
+            log.warning(f"Failed to unpack incoming packet: {type(e).__name__} {e}")
             return
 
         messages = (
