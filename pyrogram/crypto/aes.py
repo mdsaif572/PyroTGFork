@@ -43,11 +43,15 @@ if _crypto is not None:
 
 
     def ctr256_encrypt(data: bytes, key: bytes, iv: bytearray, state: bytearray = None) -> bytes:
-        return _crypto.ctr256_encrypt(bytes(data), bytes(key), iv, state or bytearray(1))
+        iv_ba = iv if isinstance(iv, bytearray) else bytearray(iv)
+        state_ba = (state if isinstance(state, bytearray) else bytearray(state)) if state is not None else bytearray(1)
+        return _crypto.ctr256_encrypt(bytes(data), bytes(key), iv_ba, state_ba)
 
 
     def ctr256_decrypt(data: bytes, key: bytes, iv: bytearray, state: bytearray = None) -> bytes:
-        return _crypto.ctr256_decrypt(bytes(data), bytes(key), iv, state or bytearray(1))
+        iv_ba = iv if isinstance(iv, bytearray) else bytearray(iv)
+        state_ba = (state if isinstance(state, bytearray) else bytearray(state)) if state is not None else bytearray(1)
+        return _crypto.ctr256_decrypt(bytes(data), bytes(key), iv_ba, state_ba)
 
 
     def xor(a: bytes, b: bytes) -> bytes:
