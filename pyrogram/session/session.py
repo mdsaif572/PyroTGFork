@@ -29,7 +29,7 @@ from pyrogram import raw
 from pyrogram.connection import Connection
 from pyrogram.crypto import mtproto
 from pyrogram.errors import (
-    RPCError, InternalServerError, AuthKeyDuplicated,
+    RPCError, InternalServerError, AuthKeyDuplicated, AuthKeyUnregistered,
     FloodWait, FloodPremiumWait,
     ServiceUnavailable, BadMsgNotification,
     SecurityCheckMismatch,
@@ -137,6 +137,7 @@ class Session:
 
 
     async def start(self):
+        retries = 0
         while True:
             self.connection = Connection(
                 self.dc_id,
@@ -182,11 +183,18 @@ class Session:
                 log.info(f"Device: {self.client.device_model} - {self.client.app_version}")
                 log.info(f"System: {self.client.system_version} ({self.client.lang_code.upper()})")
 
-            except AuthKeyDuplicated as e:
+            except (AuthKeyDuplicated, AuthKeyUnregistered) as e:
                 await self.stop()
                 raise e
-            except (OSError, TimeoutError, RPCError):
+            except RPCError as e:
                 await self.stop()
+                raise e
+            except (OSError, TimeoutError) as e:
+                await self.stop()
+                retries += 1
+                if retries >= 3:
+                    raise ConnectionError(f"Failed to connect to DC {self.dc_id} after {retries} attempts: {e}")
+                await asyncio.sleep(1)
             except Exception as e:
                 await self.stop()
                 raise e
