@@ -42,16 +42,16 @@ class TCPIntermediateO(TCP):
         while True:
             nonce = bytearray(os.urandom(64))
 
-            if nonce[0] != b"\xef" and nonce[:4] not in self.RESERVED and nonce[4:4] != b"\x00" * 4:
+            if bytes([nonce[0]]) != b"\xef" and nonce[:4] not in self.RESERVED and nonce[4:8] != b"\x00" * 4:
                 nonce[56] = nonce[57] = nonce[58] = nonce[59] = 0xee
                 break
 
         temp = bytearray(nonce[55:7:-1])
 
-        self.encrypt = (nonce[8:40], nonce[40:56], bytearray(1))
-        self.decrypt = (temp[0:32], temp[32:48], bytearray(1))
+        self.encrypt = (bytes(nonce[8:40]), nonce[40:56], bytearray(1))
+        self.decrypt = (bytes(temp[0:32]), temp[32:48], bytearray(1))
 
-        nonce[56:64] = aes.ctr256_encrypt(nonce, *self.encrypt)[56:64]
+        nonce[56:64] = aes.ctr256_encrypt(bytes(nonce), *self.encrypt)[56:64]
 
         await super().send(nonce)
 

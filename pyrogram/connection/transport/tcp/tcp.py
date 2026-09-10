@@ -88,6 +88,19 @@ class TCP:
 
         self.reader, self.writer = await asyncio.open_connection(sock=self.socket)
 
+        try:
+            sock = self.writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                socket_buffer = int(os.environ.get("PYROTGFORK_SOCKET_BUFFER", 0))
+                if socket_buffer > 0:
+                    for option in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+                        if socket_buffer > sock.getsockopt(socket.SOL_SOCKET, option):
+                            sock.setsockopt(socket.SOL_SOCKET, option, socket_buffer)
+        except OSError:
+            pass
+
     def close(self):
         try:
             self.writer.close()

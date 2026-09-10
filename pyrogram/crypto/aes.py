@@ -35,19 +35,19 @@ except ImportError:
 if _crypto is not None:
 
     def ige256_encrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
-        return _crypto.ige256_encrypt(data, key, iv)
+        return _crypto.ige256_encrypt(bytes(data), bytes(key), bytes(iv))
 
 
     def ige256_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
-        return _crypto.ige256_decrypt(data, key, iv)
+        return _crypto.ige256_decrypt(bytes(data), bytes(key), bytes(iv))
 
 
     def ctr256_encrypt(data: bytes, key: bytes, iv: bytearray, state: bytearray = None) -> bytes:
-        return _crypto.ctr256_encrypt(data, key, iv, state or bytearray(1))
+        return _crypto.ctr256_encrypt(bytes(data), bytes(key), iv, state or bytearray(1))
 
 
     def ctr256_decrypt(data: bytes, key: bytes, iv: bytearray, state: bytearray = None) -> bytes:
-        return _crypto.ctr256_decrypt(data, key, iv, state or bytearray(1))
+        return _crypto.ctr256_decrypt(bytes(data), bytes(key), iv, state or bytearray(1))
 
 
     def xor(a: bytes, b: bytes) -> bytes:

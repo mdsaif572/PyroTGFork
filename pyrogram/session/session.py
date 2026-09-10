@@ -20,6 +20,7 @@ import asyncio
 import bisect
 import logging
 import os
+import time
 from hashlib import sha1
 from io import BytesIO
 
@@ -93,6 +94,8 @@ class Session:
         raw.functions.InvokeWithBusinessConnection,
     )
 
+    INLINE_CRYPTO_MAX = int(os.environ.get("PYROTGFORK_INLINE_CRYPTO_MAX", 32 * 1024))
+
     def __init__(
         self,
         client: "pyrogram.Client",
@@ -108,6 +111,7 @@ class Session:
         self.test_mode = test_mode
         self.is_media = is_media
         self.is_cdn = is_cdn
+        self.last_used = time.monotonic()
 
         self.connection = None
 
@@ -225,15 +229,22 @@ class Session:
 
     async def handle_packet(self, packet):
         try:
-            data = await self.client.loop.run_in_executor(
-                pyrogram.crypto_executor,
-                mtproto.unpack,
-                BytesIO(packet),
-                self.session_id,
-                self.auth_key,
-                self.auth_key_id,
-                # self.stored_msg_ids
-            )
+            if len(packet) <= Session.INLINE_CRYPTO_MAX:
+                data = mtproto.unpack(
+                    BytesIO(packet),
+                    self.session_id,
+                    self.auth_key,
+                    self.auth_key_id,
+                )
+            else:
+                data = await self.client.loop.run_in_executor(
+                    pyrogram.crypto_executor,
+                    mtproto.unpack,
+                    BytesIO(packet),
+                    self.session_id,
+                    self.auth_key,
+                    self.auth_key_id,
+                )
         except SecurityCheckMismatch:
             return
 
@@ -422,6 +433,7 @@ class Session:
         sleep_threshold: float = SLEEP_THRESHOLD
     ):
         sleep_threshold = max(sleep_threshold, self.client.sleep_threshold)
+        self.last_used = time.monotonic()
 
         try:
             await asyncio.wait_for(self.is_connected.wait(), self.WAIT_TIMEOUT)

@@ -52,6 +52,26 @@ class Terminate:
 
         self.media_sessions.clear()
 
+        for pool in self.media_session_pools.values():
+            for session in pool:
+                try:
+                    await session.stop()
+                except Exception:
+                    pass
+
+        self.media_session_pools.clear()
+
+        self.media_pool_reaper_event.set()
+
+        if self.media_pool_reaper_task is not None:
+            try:
+                await self.media_pool_reaper_task
+            except Exception:
+                pass
+            self.media_pool_reaper_task = None
+
+        self.media_pool_reaper_event.clear()
+
         self.updates_watchdog_event.set()
 
         if self.updates_watchdog_task is not None:

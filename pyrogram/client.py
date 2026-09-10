@@ -58,11 +58,72 @@ from .connection import Connection
 from .connection.transport import TCP, TCPAbridged, TCPFull
 from .dispatcher import Dispatcher
 from .file_id import FileId, FileType, ThumbnailSource
+from .methods.rate_limiter import TokenBucket
 from .mime_types import mime_types
 from .parser import Parser
 from .session.internals import MsgId
+import math
+import time
+import weakref
 
 log = logging.getLogger(__name__)
+
+_transfer_budgets: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def transfer_budget(size: int) -> asyncio.Semaphore:
+    loop = asyncio.get_event_loop()
+    budget = _transfer_budgets.get(loop)
+
+    if budget is None:
+        budget = asyncio.Semaphore(size)
+        _transfer_budgets[loop] = budget
+
+    return budget
+
+
+class ReadAhead:
+    """Borrows read-ahead slots from a client-wide budget and always gives them back."""
+
+    __slots__ = ("_budget", "_held")
+
+    def __init__(self, budget: asyncio.Semaphore):
+        self._budget = budget
+        self._held = 0
+
+    async def acquire(self):
+        await self._budget.acquire()
+        self._held += 1
+
+    def release(self):
+        if self._held:
+            self._held -= 1
+            self._budget.release()
+
+    def release_all(self):
+        while self._held:
+            self.release()
+
+
+_pwrite = getattr(os, "pwrite", None)
+
+
+def write_at(fd: int, data: bytes, offset: int) -> None:
+    """Write *data* at *offset* without disturbing the file position."""
+    view = memoryview(data)
+
+    if _pwrite is not None:
+        while view:
+            written = _pwrite(fd, view, offset)
+            view = view[written:]
+            offset += written
+        return
+
+    os.lseek(fd, offset, os.SEEK_SET)
+
+    while view:
+        view = view[os.write(fd, view):]
+
 
 
 class Client(Methods):
@@ -247,6 +308,9 @@ class Client(Methods):
     MAX_CONCURRENT_TRANSMISSIONS = 1
     MAX_CACHE_SIZE = 10000
 
+    MEDIA_SESSION_IDLE_TIMEOUT = 30
+    MEDIA_SESSION_REAP_INTERVAL = 5
+
     mimetypes = MimeTypes()
     mimetypes.readfp(StringIO(mime_types))
 
@@ -350,6 +414,11 @@ class Client(Methods):
 
         self.media_sessions = {}
         self.media_sessions_lock = asyncio.Lock()
+        self.media_session_pools = {}
+        self._media_sessions_locks = {}
+        self.media_pool_reaper_task = None
+        self.media_pool_reaper_event = asyncio.Event()
+        self.read_ahead_slots = asyncio.Semaphore(int(os.environ.get("PYROTGFORK_READ_AHEAD_SLOTS", 32)))
 
         self.save_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
         self.get_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
@@ -405,6 +474,127 @@ class Client(Methods):
 
             if datetime.now() - self.last_update_time > timedelta(seconds=self.UPDATES_WATCHDOG_INTERVAL):
                 await self.invoke(raw.functions.updates.GetState())
+
+    async def media_pool_reaper(self):
+        """Close media sessions that have gone idle since their transfer ended."""
+        while True:
+            try:
+                await asyncio.wait_for(
+                    self.media_pool_reaper_event.wait(),
+                    self.MEDIA_SESSION_REAP_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                pass
+            else:
+                break
+
+            try:
+                await self.reap_media_sessions()
+            except Exception:
+                log.exception("Media session reaper failed")
+
+    async def reap_media_sessions(self, idle_timeout: Optional[int] = None) -> int:
+        """Stop pooled media sessions unused for longer than *idle_timeout* seconds."""
+        if idle_timeout is None:
+            idle_timeout = self.MEDIA_SESSION_IDLE_TIMEOUT
+
+        now = time.monotonic()
+        reaped = 0
+
+        for dc_id in list(self.media_session_pools):
+            lock = self._media_sessions_locks.setdefault(dc_id, asyncio.Lock())
+
+            async with lock:
+                pool = self.media_session_pools.get(dc_id) or []
+                keep = []
+
+                for session in pool:
+                    last_used = getattr(session, "last_used", 0)
+                    if session.results or (now - last_used) < idle_timeout:
+                        keep.append(session)
+                        continue
+
+                    try:
+                        await session.stop()
+                    except Exception:
+                        log.exception("Error stopping idle media session")
+
+                    reaped += 1
+
+                if keep:
+                    self.media_session_pools[dc_id] = keep
+                else:
+                    self.media_session_pools.pop(dc_id, None)
+
+        if reaped:
+            log.info("Reaped %s idle media session(s)", reaped)
+
+        return reaped
+
+    async def _get_media_session_pool(self, dc_id: int, n: int) -> list:
+        lock = self._media_sessions_locks.setdefault(dc_id, asyncio.Lock())
+        async with lock:
+            pool = []
+            for session in self.media_session_pools.get(dc_id, []):
+                if getattr(session, "is_connected", None) and session.is_connected.is_set():
+                    pool.append(session)
+                else:
+                    try:
+                        asyncio.create_task(session.stop())
+                    except Exception:
+                        pass
+
+            needed = n - len(pool)
+            if needed > 0:
+                base_session = self.media_sessions.get(dc_id)
+                if not base_session:
+                    base_session = self.media_sessions[dc_id] = Session(
+                        self, dc_id,
+                        await Auth(self, dc_id, await self.storage.test_mode()).create()
+                        if dc_id != await self.storage.dc_id()
+                        else await self.storage.auth_key(),
+                        await self.storage.test_mode(),
+                        is_media=True
+                    )
+                    await base_session.start()
+
+                    if dc_id != await self.storage.dc_id():
+                        for _ in range(3):
+                            exported_auth = await self.invoke(
+                                raw.functions.auth.ExportAuthorization(
+                                    dc_id=dc_id
+                                )
+                            )
+                            try:
+                                await base_session.invoke(
+                                    raw.functions.auth.ImportAuthorization(
+                                        id=exported_auth.id,
+                                        bytes=exported_auth.bytes
+                                    )
+                                )
+                            except AuthBytesInvalid:
+                                continue
+                            else:
+                                break
+                        else:
+                            raise AuthBytesInvalid
+
+                while needed > 0:
+                    chunk = min(needed, 3)
+                    new_sessions = [
+                        Session(
+                            self, dc_id, base_session.auth_key,
+                            await self.storage.test_mode(), is_media=True
+                        )
+                        for _ in range(chunk)
+                    ]
+                    for s in new_sessions:
+                        await s.start()
+                    pool.extend(new_sessions)
+                    needed -= chunk
+
+            self.media_session_pools[dc_id] = pool
+            return list(pool)
 
     async def authorize(self) -> User:
         if self.bot_token:
@@ -1072,22 +1262,32 @@ class Client(Methods):
         file_id, directory, file_name, in_memory, file_size, progress, progress_args = packet
 
         os.makedirs(directory, exist_ok=True) if not in_memory else None
-        mcfn = re.sub("\\\\", "/", os.path.join(directory, file_name))
+        mcfn = re.sub(r"[\\/]", "/", os.path.join(directory, file_name))
         temp_file_path = os.path.abspath(mcfn) + ".temp"
-        file = BytesIO() if in_memory else open(temp_file_path, "wb")
+        file = BytesIO() if in_memory else open(temp_file_path, "w+b")
+        if not in_memory and file_size > 0:
+            file.truncate(file_size)
 
         try:
-            async for chunk in self.get_file(file_id, file_size, 0, 0, progress, progress_args):
-                file.write(chunk)
+            async for chunk in self.get_file(
+                file_id, file_size, 0, 0, progress, progress_args,
+                _write_file=None if in_memory else file
+            ):
+                if in_memory:
+                    file.write(chunk)
         except BaseException as e:
             if not in_memory:
                 file.close()
-                os.remove(temp_file_path)
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+
+            if isinstance(e, pyrogram.StopTransmission):
+                return None
 
             if isinstance(e, asyncio.CancelledError):
                 raise e
 
-            return None
+            raise e
         else:
             if in_memory:
                 file.name = file_name
@@ -1106,7 +1306,8 @@ class Client(Methods):
         limit: int = 0,
         offset: int = 0,
         progress: Callable = None,
-        progress_args: tuple = ()
+        progress_args: tuple = (),
+        _write_file: object = None,
     ) -> Optional[AsyncGenerator[bytes, None]]:
         async with self.get_file_semaphore:
             file_type = file_id.file_type
@@ -1153,9 +1354,57 @@ class Client(Methods):
             chunk_size = 1024 * 1024
             offset_bytes = abs(offset) * chunk_size
 
+            async def _report(sent: int) -> None:
+                if not progress:
+                    return
+
+                func = functools.partial(
+                    progress,
+                    min(sent, file_size) if file_size else sent,
+                    file_size,
+                    *progress_args
+                )
+
+                try:
+                    if inspect.iscoroutinefunction(progress):
+                        await func()
+                    else:
+                        await self.loop.run_in_executor(self.executor, func)
+                except pyrogram.StopTransmission:
+                    raise
+                except Exception as e:
+                    log.warning(f"Download progress callback error: {e}")
+
             dc_id = file_id.dc_id
 
             try:
+                _is_bot = self.me.is_bot if hasattr(self.me, "is_bot") else False
+                _is_premium = self.me.is_premium if hasattr(self.me, "is_premium") else False
+
+                if _is_bot:
+                    dl_pool_size = int(os.environ.get("PYROTGFORK_DL_POOL_BOT") or os.environ.get("WZGRAM_DL_POOL_BOT", 5))
+                    dl_workers_per_session = int(os.environ.get("PYROTGFORK_DL_WORKERS_BOT") or os.environ.get("WZGRAM_DL_WORKERS_BOT", 3))
+                    dl_rate = int(os.environ.get("PYROTGFORK_DL_RATE_BOT") or os.environ.get("WZGRAM_DL_RATE_BOT", 100))
+                    dl_burst = int(os.environ.get("PYROTGFORK_DL_BURST_BOT") or os.environ.get("WZGRAM_DL_BURST_BOT", 25))
+                elif _is_premium:
+                    dl_pool_size = int(os.environ.get("PYROTGFORK_DL_POOL_PREMIUM") or os.environ.get("WZGRAM_DL_POOL_PREMIUM", 6))
+                    dl_workers_per_session = int(os.environ.get("PYROTGFORK_DL_WORKERS_PREMIUM") or os.environ.get("WZGRAM_DL_WORKERS_PREMIUM", 4))
+                    dl_rate = int(os.environ.get("PYROTGFORK_DL_RATE_PREMIUM") or os.environ.get("WZGRAM_DL_RATE_PREMIUM", 150))
+                    dl_burst = int(os.environ.get("PYROTGFORK_DL_BURST_PREMIUM") or os.environ.get("WZGRAM_DL_BURST_PREMIUM", 35))
+                else:
+                    dl_pool_size = int(os.environ.get("PYROTGFORK_DL_POOL_USER") or os.environ.get("WZGRAM_DL_POOL_USER", 5))
+                    dl_workers_per_session = int(os.environ.get("PYROTGFORK_DL_WORKERS_USER") or os.environ.get("WZGRAM_DL_WORKERS_USER", 3))
+                    dl_rate = int(os.environ.get("PYROTGFORK_DL_RATE_USER") or os.environ.get("WZGRAM_DL_RATE_USER", 100))
+                    dl_burst = int(os.environ.get("PYROTGFORK_DL_BURST_USER") or os.environ.get("WZGRAM_DL_BURST_USER", 25))
+
+                total_chunks = math.ceil((file_size - offset_bytes) / chunk_size) if file_size > 0 else 1
+                pool_size = min(dl_pool_size, total_chunks)
+                total_workers = min(dl_pool_size * dl_workers_per_session, total_chunks)
+                needs_pool = min(total, total_chunks) > 1
+                if needs_pool:
+                    pool_task = asyncio.ensure_future(self._get_media_session_pool(dc_id, pool_size))
+                    pool_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
                 session = self.media_sessions.get(dc_id)
                 if not session:
                     session = self.media_sessions[dc_id] = Session(
@@ -1196,43 +1445,204 @@ class Client(Methods):
                         offset=offset_bytes,
                         limit=chunk_size
                     ),
-                    sleep_threshold=self.sleep_threshold
+                    sleep_threshold=30
                 )
 
                 if isinstance(r, raw.types.upload.File):
-                    while True:
-                        chunk = r.bytes
+                    first_chunk = r.bytes
+                    r = None
+                    yield first_chunk
+                    current += 1
+                    offset_bytes += chunk_size
+                    if _write_file is not None:
+                        _write_file.seek(0)
+                        _write_file.write(first_chunk)
 
-                        yield chunk
+                    first_len = len(first_chunk)
+                    first_chunk = None
 
-                        current += 1
-                        offset_bytes += chunk_size
+                    await _report(offset_bytes)
 
-                        if progress:
-                            func = functools.partial(
-                                progress,
-                                min(offset_bytes, file_size)
-                                if file_size != 0
-                                else offset_bytes,
-                                file_size,
-                                *progress_args
+                    if not first_len or first_len < chunk_size or current >= total:
+                        return
+
+                    # Sequential fallback when file size is unknown
+                    if file_size <= 0:
+                        while current < total:
+                            r = await session.invoke(
+                                raw.functions.upload.GetFile(
+                                    location=location,
+                                    offset=offset_bytes,
+                                    limit=chunk_size,
+                                ),
+                                sleep_threshold=30,
                             )
+                            chunk = r.bytes
+                            if not chunk:
+                                return
+                            yield chunk
+                            if _write_file is not None:
+                                _write_file.write(chunk)
+                            current += 1
+                            offset_bytes += chunk_size
 
-                            if inspect.iscoroutinefunction(progress):
-                                await func()
+                            await _report(offset_bytes)
+
+                            if len(chunk) < chunk_size or current >= total:
+                                return
+                        return
+
+                    total_chunks = math.ceil((file_size - offset_bytes) / chunk_size)
+                    pool_size = min(dl_pool_size, total_chunks)
+                    total_workers = min(dl_pool_size * dl_workers_per_session, total_chunks)
+                    if needs_pool:
+                        pool = await pool_task
+                    else:
+                        pool = [session]
+                    n_sessions = len(pool) if pool else 1
+
+                    work = asyncio.Queue()
+                    chunks_needed = min(
+                        total - current,
+                        math.ceil((file_size - offset_bytes) / chunk_size),
+                    )
+                    for i in range(chunks_needed):
+                        work.put_nowait(offset_bytes + i * chunk_size)
+
+                    _write_mode = _write_file is not None and file_size > 0
+                    data_ready = asyncio.Event()
+                    buffer_slots = ReadAhead(self.read_ahead_slots)
+                    if not _write_mode:
+                        received = {}
+                    else:
+                        _write_fd = _write_file.fileno()
+                    _done_count = 0
+                    _total_chunks = chunks_needed
+                    _getfile_rate = TokenBucket(rate=dl_rate, burst=dl_burst)
+                    _last_rate_adj = 0.0
+                    _fast_window = 0
+
+                    async def _worker(sess):
+                        nonlocal _done_count, _last_rate_adj, _fast_window
+                        while True:
+                            await buffer_slots.acquire()
+
+                            try:
+                                off = work.get_nowait()
+                            except asyncio.QueueEmpty:
+                                buffer_slots.release()
+                                return
+
+                            try:
+                                await _getfile_rate.acquire()
+                                t0 = time.monotonic()
+                                res = await sess.invoke(
+                                    raw.functions.upload.GetFile(
+                                        location=location,
+                                        offset=off,
+                                        limit=chunk_size,
+                                    ),
+                                    sleep_threshold=30,
+                                )
+                            except BaseException:
+                                buffer_slots.release()
+                                raise
+
+                            chunk_data = res.bytes
+                            res = None
+                            t1 = time.monotonic()
+
+                            if _write_mode:
+                                write_at(_write_fd, chunk_data, off)
+                                buffer_slots.release()
                             else:
-                                await self.loop.run_in_executor(self.executor, func)
+                                received[off] = chunk_data
 
-                        if len(chunk) < chunk_size or current >= total:
-                            break
+                            _done_count += 1
+                            data_ready.set()
 
-                        r = await session.invoke(
-                            raw.functions.upload.GetFile(
-                                location=location,
-                                offset=offset_bytes,
-                                limit=chunk_size
-                            )
-                        )
+                            chunk_len = len(chunk_data)
+                            chunk_data = None
+
+                            if chunk_len < chunk_size:
+                                return
+
+                            elapsed = t1 - t0
+                            now = t1
+                            if elapsed > 2.0 and now - _last_rate_adj > 0.5:
+                                _last_rate_adj = now
+                                _fast_window = 0
+                                _getfile_rate.rate = max(_getfile_rate.rate * 0.8, 3.0)
+                            elif elapsed < 0.5:
+                                _fast_window += 1
+                                if _fast_window >= 5 and now - _last_rate_adj > 0.5:
+                                    _last_rate_adj = now
+                                    _getfile_rate.rate = min(_getfile_rate.rate + 2.0, dl_rate)
+                                    _fast_window = 0
+                            else:
+                                _fast_window = 0
+
+                    tasks = [
+                        asyncio.ensure_future(_worker(pool[i % n_sessions]))
+                        for i in range(total_workers)
+                    ]
+
+                    for t in tasks:
+                        t.add_done_callback(lambda _: data_ready.set())
+
+                    _reported_count = -1
+
+                    try:
+                        while current < total:
+                            if _write_mode:
+                                if _done_count >= _total_chunks:
+                                    await _report(offset_bytes + _done_count * chunk_size)
+                                    return
+                                for t in tasks:
+                                    if t.done() and not t.cancelled():
+                                        exc = t.exception()
+                                        if exc is not None:
+                                            raise exc
+                                if all(t.done() for t in tasks):
+                                    return
+                                try:
+                                    await asyncio.wait_for(data_ready.wait(), 0.5)
+                                except asyncio.TimeoutError:
+                                    pass
+                                data_ready.clear()
+
+                                if _done_count != _reported_count:
+                                    _reported_count = _done_count
+                                    await _report(offset_bytes + _done_count * chunk_size)
+
+                                yield b""
+                            else:
+                                while offset_bytes not in received:
+                                    for t in tasks:
+                                        if t.done() and not t.cancelled():
+                                            exc = t.exception()
+                                            if exc is not None:
+                                                raise exc
+                                    if all(t.done() for t in tasks):
+                                        return
+                                    await data_ready.wait()
+                                    data_ready.clear()
+
+                                chunk = received.pop(offset_bytes)
+                                buffer_slots.release()
+                                yield chunk
+                                current += 1
+                                offset_bytes += chunk_size
+
+                                await _report(offset_bytes)
+
+                                if len(chunk) < chunk_size or current >= total:
+                                    return
+                    finally:
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
+                        buffer_slots.release_all()
 
                 elif isinstance(r, raw.types.upload.FileCdnRedirect):
                     cdn_session = Session(
