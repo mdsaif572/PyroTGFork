@@ -76,6 +76,7 @@ class Result:
 class Session:
     START_TIMEOUT = 1
     WAIT_TIMEOUT = 15
+    MEDIA_WAIT_TIMEOUT = int(os.environ.get("PYROTGFORK_MEDIA_TIMEOUT", os.environ.get("WZGRAM_MEDIA_TIMEOUT", 60)))
     SLEEP_THRESHOLD = 10
     MAX_RETRIES = 5
     ACKS_THRESHOLD = 8
@@ -250,6 +251,10 @@ class Session:
                 log.error(e, exc_info=True)
 
         log.info("Session stopped")
+
+    @property
+    def is_restarting(self) -> bool:
+        return False
 
     async def restart(self):
         await self.stop()
@@ -439,7 +444,8 @@ class Session:
             except asyncio.TimeoutError:
                 pass
             finally:
-                result = self.results.pop(msg_id).value
+                res_obj = self.results.pop(msg_id, None)
+                result = res_obj.value if res_obj is not None else None
 
             if result is None:
                 raise TimeoutError

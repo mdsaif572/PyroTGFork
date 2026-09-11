@@ -50,6 +50,7 @@ class TCP:
 
         self.lock = asyncio.Lock()
         self.loop = utils.get_event_loop()
+        self.is_connected = False
 
         if proxy:
             hostname = proxy.get("hostname")
@@ -88,6 +89,7 @@ class TCP:
             await self.loop.run_in_executor(executor, self.socket.connect, address)
 
         self.reader, self.writer = await asyncio.open_connection(sock=self.socket)
+        self.is_connected = True
 
         try:
             sock = self.writer.get_extra_info("socket")
@@ -103,23 +105,35 @@ class TCP:
             pass
 
     def close(self):
+        self.is_connected = False
         try:
-            self.writer.close()
-        except AttributeError:
-            try:
+            if self.writer is not None:
+                self.writer.close()
+        except Exception:
+            pass
+        try:
+            if self.socket is not None:
                 self.socket.shutdown(socket.SHUT_RDWR)
-            except OSError:
+        except OSError:
+            pass
+        finally:
+            time.sleep(0.001)
+            try:
+                if self.socket is not None:
+                    self.socket.close()
+            except Exception:
                 pass
-            finally:
-                # A tiny sleep placed here helps avoiding .recv(n) hanging until the timeout.
-                # This is a workaround that seems to fix the occasional delayed stop of a client.
-                time.sleep(0.001)
-                self.socket.close()
 
     async def send(self, data: bytes):
         async with self.lock:
-            self.writer.write(data)
-            await self.writer.drain()
+            if not getattr(self, "is_connected", False) or self.writer is None:
+                raise OSError("Connection closed")
+            try:
+                self.writer.write(data)
+                await self.writer.drain()
+            except Exception as e:
+                self.is_connected = False
+                raise OSError(e)
 
     async def recv(self, length: int = 0):
         data = b""

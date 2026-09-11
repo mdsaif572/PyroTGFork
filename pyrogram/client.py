@@ -418,7 +418,7 @@ class Client(Methods):
         self._media_sessions_locks = {}
         self.media_pool_reaper_task = None
         self.media_pool_reaper_event = asyncio.Event()
-        self.read_ahead_slots = asyncio.Semaphore(int(os.environ.get("PYROTGFORK_READ_AHEAD_SLOTS", 32)))
+        self.read_ahead_slots = asyncio.Semaphore(int(os.environ.get("PYROTGFORK_READ_AHEAD_SLOTS", os.environ.get("WZGRAM_MAX_READ_AHEAD", 64))))
 
         self.save_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
         self.get_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
@@ -580,7 +580,7 @@ class Client(Methods):
                             raise AuthBytesInvalid
 
                 while needed > 0:
-                    chunk = min(needed, 3)
+                    chunk = min(needed, 4)
                     new_sessions = [
                         Session(
                             self, dc_id, base_session.auth_key,
@@ -588,13 +588,22 @@ class Client(Methods):
                         )
                         for _ in range(chunk)
                     ]
-                    for s in new_sessions:
-                        await s.start()
-                    pool.extend(new_sessions)
+                    async def _start(s):
+                        try:
+                            await s.start()
+                            return s
+                        except Exception as e:
+                            log.warning(f"Failed to start pooled media session: {e}")
+                            return None
+
+                    results = await asyncio.gather(*(_start(s) for s in new_sessions))
+                    for s in results:
+                        if s is not None:
+                            pool.append(s)
                     needed -= chunk
 
             self.media_session_pools[dc_id] = pool
-            return list(pool)
+            return list(pool) if pool else [self.session]
 
     async def authorize(self) -> User:
         if self.bot_token:
