@@ -106,13 +106,15 @@ class Storage(ABC):
     async def api_id(self, value: int = object) -> int:
         raise NotImplementedError
 
-    @abstractmethod
     async def server_address(self, value: str = object) -> str:
-        raise NotImplementedError
+        if value is not object:
+            self._server_address = value
+        return getattr(self, "_server_address", None)
 
-    @abstractmethod
     async def port(self, value: int = object) -> int:
-        raise NotImplementedError
+        if value is not object:
+            self._port = value
+        return getattr(self, "_port", None)
 
     @abstractmethod
     async def test_mode(self, value: bool = object) -> bool:

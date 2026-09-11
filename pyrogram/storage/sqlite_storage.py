@@ -489,6 +489,16 @@ CREATE TABLE update_state
     async def is_bot(self, value: bool = object):
         return await self._accessor(value)
 
+    async def server_address(self, value: str = object):
+        if value is not object:
+            self._server_address = value
+        return getattr(self, "_server_address", None)
+
+    async def port(self, value: int = object):
+        if value is not object:
+            self._port = value
+        return getattr(self, "_port", None)
+
     async def version(self, value: int = object):
         if value == object:
             return await self.loop.run_in_executor(self.executor, self._get_version_impl)
