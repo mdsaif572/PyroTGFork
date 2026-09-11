@@ -548,37 +548,41 @@ class Client(Methods):
             if needed > 0:
                 base_session = self.media_sessions.get(dc_id)
                 if not base_session:
+                    base_auth_key = await self.storage.auth_key() if dc_id == await self.storage.dc_id() else await Auth(self, dc_id, await self.storage.test_mode()).create()
                     base_session = self.media_sessions[dc_id] = Session(
                         self, dc_id,
-                        await Auth(self, dc_id, await self.storage.test_mode()).create()
-                        if dc_id != await self.storage.dc_id()
-                        else await self.storage.auth_key(),
+                        base_auth_key,
                         await self.storage.test_mode(),
                         is_media=True
                     )
-                    await base_session.start()
+                    try:
+                        await base_session.start()
+                    except Exception as e:
+                        log.warning(f"Failed to start base media session: {e}")
 
                     if dc_id != await self.storage.dc_id():
                         for _ in range(3):
-                            exported_auth = await self.invoke(
-                                raw.functions.auth.ExportAuthorization(
-                                    dc_id=dc_id
-                                )
-                            )
                             try:
+                                exported_auth = await self.invoke(
+                                    raw.functions.auth.ExportAuthorization(
+                                        dc_id=dc_id
+                                    )
+                                )
                                 await base_session.invoke(
                                     raw.functions.auth.ImportAuthorization(
                                         id=exported_auth.id,
                                         bytes=exported_auth.bytes
                                     )
                                 )
-                            except AuthBytesInvalid:
+                            except Exception:
                                 continue
                             else:
                                 break
-                        else:
-                            raise AuthBytesInvalid
 
+                if base_session and getattr(base_session, "is_connected", None) and base_session.is_connected.is_set() and base_session not in pool:
+                    pool.append(base_session)
+
+                needed = n - len(pool)
                 while needed > 0:
                     chunk = min(needed, 4)
                     new_sessions = [
@@ -603,6 +607,7 @@ class Client(Methods):
                     needed -= chunk
 
             self.media_session_pools[dc_id] = pool
+            log.info(f"Media session pool DC{dc_id}: {len(pool)} sessions ready (requested {n})")
             return list(pool) if pool else [self.session]
 
     async def authorize(self) -> User:

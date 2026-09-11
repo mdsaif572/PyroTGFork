@@ -20,9 +20,15 @@ import asyncio
 import bisect
 import logging
 import os
+import struct
 import time
 from hashlib import sha1
 from io import BytesIO
+
+try:
+    import warpcrypto
+except ImportError:
+    warpcrypto = None
 
 import pyrogram
 from pyrogram import raw
@@ -39,6 +45,28 @@ from pyrogram.raw.core import TLObject, MsgContainer, Int, FutureSalts
 from .internals import MsgId, MsgFactory
 
 log = logging.getLogger(__name__)
+
+
+def _serialize_file_part(data: TLObject):
+    if isinstance(data, raw.functions.upload.SaveBigFilePart):
+        header = struct.pack(
+            "<Iqii", data.ID, data.file_id, data.file_part, data.file_total_parts
+        )
+    elif isinstance(data, raw.functions.upload.SaveFilePart):
+        header = struct.pack("<Iqi", data.ID, data.file_id, data.file_part)
+    else:
+        return None
+
+    length = len(data.bytes)
+
+    if length > 253:
+        prefix = b"\xfe" + length.to_bytes(3, "little")
+        padding = -length % 4
+    else:
+        prefix = bytes((length,))
+        padding = -(length + 1) % 4
+
+    return b"".join((header, prefix, data.bytes, bytes(padding)))
 
 
 def _upload_part_length(data: TLObject):
@@ -74,7 +102,7 @@ class Result:
 
 
 class Session:
-    START_TIMEOUT = 1
+    START_TIMEOUT = 10
     WAIT_TIMEOUT = 15
     MEDIA_WAIT_TIMEOUT = int(os.environ.get("PYROTGFORK_MEDIA_TIMEOUT", os.environ.get("WZGRAM_MEDIA_TIMEOUT", 60)))
     SLEEP_THRESHOLD = 10
@@ -153,7 +181,8 @@ class Session:
 
                 self.network_task = self.client.loop.create_task(self.network_worker())
 
-                await self.send(raw.functions.Ping(ping_id=0), timeout=self.START_TIMEOUT)
+                handshake_timeout = min(self.START_TIMEOUT + (retries * 2), self.WAIT_TIMEOUT)
+                await self.send(raw.functions.Ping(ping_id=0), timeout=handshake_timeout)
 
                 if not self.is_cdn:
                     storage_api_id = await self.client.storage.api_id()
@@ -180,7 +209,7 @@ class Session:
                                 layer=current_layer,
                                 query=init_query
                             ),
-                            timeout=self.START_TIMEOUT
+                            timeout=handshake_timeout
                         )
                     except RPCError as e:
                         if "CONNECTION_LAYER_INVALID" in (getattr(e, "ID", "") or str(e)):
@@ -192,7 +221,7 @@ class Session:
                                     layer=current_layer,
                                     query=init_query
                                 ),
-                                timeout=self.START_TIMEOUT
+                                timeout=handshake_timeout
                             )
                         else:
                             raise e
@@ -411,26 +440,54 @@ class Session:
         wait_response: bool = True,
         timeout: float = WAIT_TIMEOUT
     ):
-        message = self.msg_factory(data, _upload_part_length(data))
+        if not self.is_connected.is_set():
+            raise OSError("Connection is not established")
+
+        serialized = _serialize_file_part(data)
+        if serialized is None:
+            serialized = data.write()
+
+        message = self.msg_factory(data, len(serialized))
         msg_id = message.msg_id
 
         if wait_response:
             self.results[msg_id] = Result()
 
-        # Call log.debug twice because calling it once by appending "data" to the previous string (i.e. f"Kind: {data}")
-        # will cause "data" to be evaluated as string every time instead of only when debug is actually enabled.
-        log.debug(f"Sent:")
-        log.debug(message)
+        log.debug(f"Sent: {message}")
 
-        payload = await self.client.loop.run_in_executor(
-            pyrogram.crypto_executor,
-            mtproto.pack,
-            message,
-            self.salt,
-            self.session_id,
-            self.auth_key,
-            self.auth_key_id
-        )
+        if warpcrypto is not None and hasattr(warpcrypto, "pack_message"):
+            if len(serialized) <= Session.INLINE_CRYPTO_MAX:
+                payload = warpcrypto.pack_message(
+                    message.msg_id,
+                    message.seq_no,
+                    serialized,
+                    self.salt,
+                    self.session_id,
+                    self.auth_key,
+                    self.auth_key_id
+                )
+            else:
+                payload = await self.client.loop.run_in_executor(
+                    pyrogram.crypto_executor,
+                    warpcrypto.pack_message,
+                    message.msg_id,
+                    message.seq_no,
+                    serialized,
+                    self.salt,
+                    self.session_id,
+                    self.auth_key,
+                    self.auth_key_id
+                )
+        else:
+            payload = await self.client.loop.run_in_executor(
+                pyrogram.crypto_executor,
+                mtproto.pack,
+                message,
+                self.salt,
+                self.session_id,
+                self.auth_key,
+                self.auth_key_id
+            )
 
         try:
             await self.connection.send(payload)

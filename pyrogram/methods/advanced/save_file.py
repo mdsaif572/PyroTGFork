@@ -169,14 +169,14 @@ class SaveFile:
             file_total_parts = int(math.ceil(file_size / part_size))
             is_big = file_size > 10 * 1024 * 1024
             if is_bot:
-                rate_limit = int(os.environ.get("PYROTGFORK_UPLOAD_RATE_BOT", os.environ.get("WZGRAM_UPLOAD_RATE_BOT", 120)))
-                pool_size = min(int(os.environ.get("PYROTGFORK_UPLOAD_POOL_BOT", os.environ.get("WZGRAM_UPLOAD_POOL_BOT", 5))), POOL_SIZE) if is_big else 1
+                rate_limit = int(os.environ.get("PYROTGFORK_UPLOAD_RATE_BOT", os.environ.get("WZGRAM_UPLOAD_RATE_BOT", 180)))
+                pool_size = min(int(os.environ.get("PYROTGFORK_UPLOAD_POOL_BOT", os.environ.get("WZGRAM_UPLOAD_POOL_BOT", 8))), POOL_SIZE) if is_big else 1
             elif is_premium:
                 rate_limit = int(os.environ.get("PYROTGFORK_UPLOAD_RATE_PREMIUM", os.environ.get("WZGRAM_UPLOAD_RATE_PREMIUM", 300)))
                 pool_size = min(int(os.environ.get("PYROTGFORK_UPLOAD_POOL_PREMIUM", os.environ.get("WZGRAM_UPLOAD_POOL_PREMIUM", 14))), POOL_SIZE) if is_big else 1
             else:
-                rate_limit = int(os.environ.get("PYROTGFORK_UPLOAD_RATE_USER", os.environ.get("WZGRAM_UPLOAD_RATE_USER", 120)))
-                pool_size = min(int(os.environ.get("PYROTGFORK_UPLOAD_POOL_USER", os.environ.get("WZGRAM_UPLOAD_POOL_USER", 5))), POOL_SIZE) if is_big else 1
+                rate_limit = int(os.environ.get("PYROTGFORK_UPLOAD_RATE_USER", os.environ.get("WZGRAM_UPLOAD_RATE_USER", 180)))
+                pool_size = min(int(os.environ.get("PYROTGFORK_UPLOAD_POOL_USER", os.environ.get("WZGRAM_UPLOAD_POOL_USER", 8))), POOL_SIZE) if is_big else 1
 
             is_missing_part = file_id is not None
             file_id = file_id or self.rnd_id()
@@ -190,6 +190,10 @@ class SaveFile:
             _acked = [0]
 
             n_workers = len(pool) * 2
+            log.info(
+                "Upload start: name=%s, size=%s B, is_premium=%s, is_bot=%s, pool=%d, workers=%d, rate_limit=%d",
+                file_name, file_size, is_premium, is_bot, len(pool), n_workers, rate_limit
+            )
             queue = asyncio.Queue(n_workers)
             budget = ReadAhead(self.read_ahead_slots)
             workers = [
