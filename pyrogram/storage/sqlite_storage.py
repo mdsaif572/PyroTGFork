@@ -249,32 +249,27 @@ CREATE TABLE update_state
         if not self.session_string:
             return
 
+        try:
+            await self.load_session_string(self.session_string)
+            return
+        except Exception as e:
+            log.warning(f"Universal session decode failed ({e}), falling back to legacy base64 unpack")
+
         string_length = len(self.session_string)
         b64_string_unpack = base64.urlsafe_b64decode(self.session_string + "=" * (-string_length % 4))
 
-        # Old format
-        if string_length in [self.SESSION_STRING_SIZE, self.SESSION_STRING_SIZE_64]:
-            if string_length == self.SESSION_STRING_SIZE:
-                string_format = self.OLD_SESSION_STRING_FORMAT
-            else:
-                string_format = self.OLD_SESSION_STRING_FORMAT_64
-
+        if string_length in [351, 356]:
+            string_format = ">B?256sI?" if string_length == 351 else ">B?256sQ?"
             dc_id, test_mode, auth_key, user_id, is_bot = struct.unpack(string_format, b64_string_unpack)
-
             await self.dc_id(dc_id)
             await self.test_mode(test_mode)
             await self.auth_key(auth_key)
             await self.user_id(user_id)
             await self.is_bot(is_bot)
             await self.date(0)
-
-            log.warning(
-                "You are using an old session string format. Use export_session_string to update"
-            )
             return
 
-        dc_id, api_id, test_mode, auth_key, user_id, is_bot = struct.unpack(self.SESSION_STRING_FORMAT, b64_string_unpack)
-
+        dc_id, api_id, test_mode, auth_key, user_id, is_bot = struct.unpack(">BI?256sQ?", b64_string_unpack)
         await self.dc_id(dc_id)
         await self.api_id(api_id)
         await self.test_mode(test_mode)

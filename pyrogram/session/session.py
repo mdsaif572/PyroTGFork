@@ -156,7 +156,7 @@ class Session:
 
                 if not self.is_cdn:
                     init_query = raw.functions.InitConnection(
-                        api_id=await self.client.storage.api_id() or self.client.api_id,
+                        api_id=self.client.api_id or await self.client.storage.api_id(),
                         app_version=self.client.app_version,
                         device_model=self.client.device_model,
                         system_version=self.client.system_version,
@@ -194,9 +194,10 @@ class Session:
             except (OSError, TimeoutError) as e:
                 await self.stop()
                 retries += 1
+                backoff = min(2 ** min(retries - 1, 5), 30)
                 if retries >= 3:
-                    raise ConnectionError(f"Failed to connect to DC {self.dc_id} after {retries} attempts: {e}")
-                await asyncio.sleep(1)
+                    log.warning(f"Connection to DC {self.dc_id} failed: {type(e).__name__} {e}, retrying in {backoff}s (attempt {retries})...")
+                await asyncio.sleep(backoff)
             except Exception as e:
                 await self.stop()
                 raise e
