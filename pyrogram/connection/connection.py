@@ -20,6 +20,8 @@ import asyncio
 import logging
 from typing import Optional
 
+import os
+from pyrogram.crypto.executor import get_crypto_executor
 from .transport import *
 from ..session.internals import DataCenter
 
@@ -37,20 +39,45 @@ class Connection:
         4: TCPIntermediateO
     }
 
-    def __init__(self, dc_id: int, test_mode: bool, ipv6: bool, proxy: dict, media: bool = False, mode: int = 3):
+    def __init__(
+        self,
+        dc_id: int,
+        test_mode: bool,
+        ipv6: bool,
+        proxy: dict,
+        media: bool = False,
+        mode: int = None,
+        server_address: Optional[str] = None,
+        port: Optional[int] = None,
+        crypto_executor=None,
+        loop=None
+    ):
+        if mode is None:
+            mode = int(os.environ.get("PYROTGFORK_TCP_MODE", 1))
+
         self.dc_id = dc_id
         self.test_mode = test_mode
         self.ipv6 = ipv6
         self.proxy = proxy
         self.media = media
-        self.address = DataCenter(dc_id, test_mode, ipv6, media)
+        self.crypto_executor = crypto_executor or get_crypto_executor()
+        self.loop = loop
+
+        if server_address and port:
+            self.address = (server_address, port)
+        else:
+            self.address = DataCenter(dc_id, test_mode, ipv6, media)
+
         self.mode = self.MODES.get(mode, TCPAbridged)
 
         self.protocol = None  # type: TCP
 
     async def connect(self):
         for i in range(Connection.MAX_RETRIES):
-            self.protocol = self.mode(self.ipv6, self.proxy)
+            try:
+                self.protocol = self.mode(self.ipv6, self.proxy, self.crypto_executor, self.loop)
+            except TypeError:
+                self.protocol = self.mode(self.ipv6, self.proxy)
 
             try:
                 log.info("Connecting...")

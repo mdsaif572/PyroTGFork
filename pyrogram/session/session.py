@@ -24,6 +24,8 @@ import struct
 import time
 from hashlib import sha1
 from io import BytesIO
+from typing import Optional, List, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import warpcrypto
@@ -132,7 +134,10 @@ class Session:
         auth_key: bytes,
         test_mode: bool,
         is_media: bool = False,
-        is_cdn: bool = False
+        is_cdn: bool = False,
+        server_address: Optional[str] = None,
+        port: Optional[int] = None,
+        crypto_executor: Optional[ThreadPoolExecutor] = None
     ):
         self.client = client
         self.dc_id = dc_id
@@ -140,6 +145,9 @@ class Session:
         self.test_mode = test_mode
         self.is_media = is_media
         self.is_cdn = is_cdn
+        self.server_address = server_address
+        self.port = port
+        self.crypto_executor = crypto_executor or getattr(client, "crypto_executor", None) or pyrogram.crypto_executor
         self.last_used = time.monotonic()
 
         self.connection = None
@@ -173,7 +181,11 @@ class Session:
                 self.test_mode,
                 self.client.ipv6,
                 self.client.proxy,
-                self.is_media
+                self.is_media,
+                server_address=self.server_address,
+                port=self.port,
+                crypto_executor=self.crypto_executor,
+                loop=self.client.loop
             )
 
             try:
@@ -302,7 +314,7 @@ class Session:
                 )
             else:
                 data = await self.client.loop.run_in_executor(
-                    pyrogram.crypto_executor,
+                    self.crypto_executor,
                     mtproto.unpack,
                     BytesIO(packet),
                     self.session_id,
@@ -470,7 +482,7 @@ class Session:
                 )
             else:
                 payload = await self.client.loop.run_in_executor(
-                    pyrogram.crypto_executor,
+                    self.crypto_executor,
                     warpcrypto.pack_message,
                     message.msg_id,
                     message.seq_no,
@@ -482,7 +494,7 @@ class Session:
                 )
         else:
             payload = await self.client.loop.run_in_executor(
-                pyrogram.crypto_executor,
+                self.crypto_executor,
                 mtproto.pack,
                 message,
                 self.salt,

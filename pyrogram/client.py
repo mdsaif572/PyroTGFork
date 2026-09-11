@@ -61,7 +61,8 @@ from .file_id import FileId, FileType, ThumbnailSource
 from .methods.rate_limiter import TokenBucket
 from .mime_types import mime_types
 from .parser import Parser
-from .session.internals import MsgId
+from .session.internals import MsgId, DataCenter
+from pyrogram.crypto.executor import get_crypto_executor
 import math
 import time
 import weakref
@@ -412,10 +413,15 @@ class Client(Methods):
         self.parser = Parser(self)
         self.session = None
 
+        self.sessions = {}
         self.media_sessions = {}
         self.media_sessions_lock = asyncio.Lock()
         self.media_session_pools = {}
+        self._session_locks = {}
         self._media_sessions_locks = {}
+        self._session_creation_gate = asyncio.Semaphore(4)
+        self.__config: Optional[raw.types.Config] = None
+        self.crypto_executor = get_crypto_executor()
         self.media_pool_reaper_task = None
         self.media_pool_reaper_event = asyncio.Event()
         self.read_ahead_slots = asyncio.Semaphore(int(os.environ.get("PYROTGFORK_READ_AHEAD_SLOTS", os.environ.get("WZGRAM_MAX_READ_AHEAD", 64))))
@@ -531,6 +537,163 @@ class Client(Methods):
 
         return reaped
 
+    async def _make_media_session(
+        self,
+        dc_id: int,
+        auth_key: bytes,
+        server_address: Optional[str] = None,
+        port: Optional[int] = None
+    ) -> Session:
+        session = Session(
+            self, dc_id, auth_key, await self.storage.test_mode(), is_media=True,
+            server_address=server_address, port=port,
+            crypto_executor=self.crypto_executor,
+        )
+        await session.start()
+        return session
+
+    async def get_dc_option(
+        self,
+        dc_id: Optional[int] = None,
+        is_media: bool = False,
+        is_cdn: bool = False,
+        ipv6: bool = False
+    ) -> "raw.types.DcOption":
+        if self.__config is None and getattr(self, "is_connected", None) and self.is_connected.is_set():
+            try:
+                self.__config = await self.invoke(raw.functions.help.GetConfig())
+            except Exception as e:
+                log.debug("Failed to GetConfig for dc option: %s", e)
+
+        if self.__config:
+            if dc_id is None:
+                dc_id = self.__config.this_dc
+
+            options = [dc for dc in self.__config.dc_options if dc.id == dc_id and dc.ipv6 == ipv6]
+
+            if is_cdn:
+                cdn_options = [dc for dc in options if dc.cdn]
+                if cdn_options:
+                    return cdn_options[0]
+                is_media = True
+
+            if is_media:
+                media_options = [dc for dc in options if dc.media_only]
+                if media_options:
+                    return media_options[0]
+
+            prod_options = [dc for dc in options if not dc.media_only]
+            if prod_options:
+                return prod_options[0]
+
+        if dc_id is None:
+            dc_id = await self.storage.dc_id()
+        ip, port = DataCenter(dc_id, await self.storage.test_mode(), ipv6, is_media)
+        return raw.types.DcOption(
+            id=dc_id,
+            ip_address=ip,
+            port=port,
+            ipv6=ipv6,
+            media_only=is_media
+        )
+
+    async def get_session(
+        self,
+        dc_id: Optional[int] = None,
+        is_media: bool = False,
+        is_cdn: bool = False,
+        temporary: bool = False,
+        server_address: Optional[str] = None,
+        port: Optional[int] = None
+    ) -> Session:
+        if not dc_id:
+            dc_id = await self.storage.dc_id()
+
+        is_current_dc = (await self.storage.dc_id()) == dc_id
+
+        if not temporary and is_current_dc and not is_media:
+            return self.session
+
+        sessions = self.media_sessions if is_media else self.sessions
+
+        if not temporary and sessions.get(dc_id):
+            return sessions[dc_id]
+
+        lock = self._session_locks.setdefault((dc_id, bool(is_media)), asyncio.Lock())
+
+        async with lock:
+            if not temporary and sessions.get(dc_id):
+                return sessions[dc_id]
+
+            if not server_address or not port:
+                dc_option = await self.get_dc_option(dc_id, is_media=is_media, ipv6=self.ipv6, is_cdn=is_cdn)
+                server_address = server_address or dc_option.ip_address
+                port = port or dc_option.port
+
+            if is_cdn:
+                auth_key = await Auth(
+                    self,
+                    dc_id,
+                    await self.storage.test_mode(),
+                    server_address=server_address,
+                    port=port
+                ).create()
+                export_authorization = False
+            elif is_media:
+                auth_key = (await self.get_session(dc_id)).auth_key
+                export_authorization = False
+            else:
+                if not is_current_dc:
+                    auth_key = await Auth(
+                        self,
+                        dc_id,
+                        await self.storage.test_mode(),
+                        server_address=server_address,
+                        port=port
+                    ).create()
+                    export_authorization = True
+                else:
+                    auth_key = await self.storage.auth_key()
+                    export_authorization = False
+
+            session = Session(
+                self,
+                dc_id,
+                auth_key,
+                await self.storage.test_mode(),
+                is_media=is_media,
+                is_cdn=is_cdn,
+                server_address=server_address,
+                port=port,
+                crypto_executor=self.crypto_executor,
+            )
+
+            async with self._session_creation_gate:
+                await session.start()
+
+            if not is_current_dc and export_authorization:
+                for _ in range(3):
+                    try:
+                        exported_auth = await self.invoke(
+                            raw.functions.auth.ExportAuthorization(dc_id=dc_id)
+                        )
+                        await session.invoke(
+                            raw.functions.auth.ImportAuthorization(
+                                id=exported_auth.id,
+                                bytes=exported_auth.bytes
+                            )
+                        )
+                    except Exception:
+                        await asyncio.sleep(1)
+                        continue
+                    else:
+                        break
+
+            if not temporary:
+                sessions[dc_id] = session
+
+            return session
+
     async def _get_media_session_pool(self, dc_id: int, n: int) -> list:
         lock = self._media_sessions_locks.setdefault(dc_id, asyncio.Lock())
         async with lock:
@@ -546,64 +709,23 @@ class Client(Methods):
 
             needed = n - len(pool)
             if needed > 0:
-                base_session = self.media_sessions.get(dc_id)
-                if not base_session:
-                    base_auth_key = await self.storage.auth_key() if dc_id == await self.storage.dc_id() else await Auth(self, dc_id, await self.storage.test_mode()).create()
-                    base_session = self.media_sessions[dc_id] = Session(
-                        self, dc_id,
-                        base_auth_key,
-                        await self.storage.test_mode(),
-                        is_media=True
-                    )
-                    try:
-                        await base_session.start()
-                    except Exception as e:
-                        log.warning(f"Failed to start base media session: {e}")
+                media = await self.get_session(dc_id, is_media=True)
+                if media not in pool and getattr(media, "is_connected", None) and media.is_connected.is_set():
+                    pool.append(media)
+                    needed = n - len(pool)
 
-                    if dc_id != await self.storage.dc_id():
-                        for _ in range(3):
-                            try:
-                                exported_auth = await self.invoke(
-                                    raw.functions.auth.ExportAuthorization(
-                                        dc_id=dc_id
-                                    )
-                                )
-                                await base_session.invoke(
-                                    raw.functions.auth.ImportAuthorization(
-                                        id=exported_auth.id,
-                                        bytes=exported_auth.bytes
-                                    )
-                                )
-                            except Exception:
-                                continue
-                            else:
-                                break
-
-                if base_session and getattr(base_session, "is_connected", None) and base_session.is_connected.is_set() and base_session not in pool:
-                    pool.append(base_session)
-
-                needed = n - len(pool)
                 while needed > 0:
-                    chunk = min(needed, 4)
-                    new_sessions = [
-                        Session(
-                            self, dc_id, base_session.auth_key,
-                            await self.storage.test_mode(), is_media=True
-                        )
-                        for _ in range(chunk)
-                    ]
-                    async def _start(s):
-                        try:
-                            await s.start()
-                            return s
-                        except Exception as e:
-                            log.warning(f"Failed to start pooled media session: {e}")
-                            return None
-
-                    results = await asyncio.gather(*(_start(s) for s in new_sessions))
-                    for s in results:
-                        if s is not None:
-                            pool.append(s)
+                    chunk = min(needed, 3)
+                    async with self._session_creation_gate:
+                        results = await asyncio.gather(*(
+                            self._make_media_session(
+                                dc_id, media.auth_key, media.server_address, media.port
+                            )
+                            for _ in range(chunk)
+                        ), return_exceptions=True)
+                        for s in results:
+                            if isinstance(s, Session) and getattr(s, "is_connected", None) and s.is_connected.is_set():
+                                pool.append(s)
                     needed -= chunk
 
             self.media_session_pools[dc_id] = pool
