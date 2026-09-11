@@ -241,8 +241,10 @@ class Session:
             except (OSError, TimeoutError) as e:
                 await self.stop()
                 retries += 1
-                backoff = min(2 ** min(retries - 1, 5), 30)
-                if retries >= 3:
+                if retries >= self.MAX_RETRIES:
+                    raise e
+                backoff = min(2 ** min(retries - 1, 5), 10)
+                if retries >= 2:
                     log.warning(f"Connection to DC {self.dc_id} failed: {type(e).__name__} {e}, retrying in {backoff}s (attempt {retries})...")
                 await asyncio.sleep(backoff)
             except Exception as e:
@@ -440,7 +442,7 @@ class Session:
         wait_response: bool = True,
         timeout: float = WAIT_TIMEOUT
     ):
-        if not self.is_connected.is_set():
+        if not self.connection:
             raise OSError("Connection is not established")
 
         serialized = _serialize_file_part(data)
