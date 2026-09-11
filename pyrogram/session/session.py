@@ -155,8 +155,9 @@ class Session:
                 await self.send(raw.functions.Ping(ping_id=0), timeout=self.START_TIMEOUT)
 
                 if not self.is_cdn:
+                    storage_api_id = await self.client.storage.api_id()
                     init_query = raw.functions.InitConnection(
-                        api_id=self.client.api_id or await self.client.storage.api_id(),
+                        api_id=storage_api_id or self.client.api_id,
                         app_version=self.client.app_version,
                         device_model=self.client.device_model,
                         system_version=self.client.system_version,
@@ -171,17 +172,33 @@ class Session:
                         params=self.client._un_docu_gnihts[2] if len(self.client._un_docu_gnihts) == 3 else None
                     )
 
-                    await self.send(
-                        raw.functions.InvokeWithLayer(
-                            layer=layer,
-                            query=init_query
-                        ),
-                        timeout=self.START_TIMEOUT
-                    )
+                    current_layer = layer
+                    try:
+                        await self.send(
+                            raw.functions.InvokeWithLayer(
+                                layer=current_layer,
+                                query=init_query
+                            ),
+                            timeout=self.START_TIMEOUT
+                        )
+                    except RPCError as e:
+                        if "CONNECTION_LAYER_INVALID" in (getattr(e, "ID", "") or str(e)):
+                            alt_layer = 229 if current_layer == 227 else 227
+                            log.warning(f"Layer {current_layer} rejected ({e}). Retrying with layer {alt_layer}...")
+                            current_layer = alt_layer
+                            await self.send(
+                                raw.functions.InvokeWithLayer(
+                                    layer=current_layer,
+                                    query=init_query
+                                ),
+                                timeout=self.START_TIMEOUT
+                            )
+                        else:
+                            raise e
 
                 self.ping_task = self.client.loop.create_task(self.ping_worker())
 
-                log.info(f"Session initialized: Layer {layer}")
+                log.info(f"Session initialized: Layer {current_layer}")
                 log.info(f"Device: {self.client.device_model} - {self.client.app_version}")
                 log.info(f"System: {self.client.system_version} ({self.client.lang_code.upper()})")
 

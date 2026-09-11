@@ -198,6 +198,10 @@ CREATE TABLE update_state
     async def update(self):
         version = await self.version()
 
+        if version == 0:
+            await self.create()
+            return
+
         if version == 1:
             await self.loop.run_in_executor(self.executor, self._update_from_one_impl)
             version += 1
@@ -290,7 +294,7 @@ CREATE TABLE update_state
             return
 
         path = self.database
-        file_exists = isinstance(path, Path) and path.is_file()
+        file_exists = isinstance(path, Path) and path.is_file() and path.stat().st_size > 0
 
         self.executor.submit(self._connect_impl, path).result()
 
@@ -462,11 +466,20 @@ CREATE TABLE update_state
     
     def _get_version_impl(self):
         with self.conn:
-            return self.conn.execute("SELECT number FROM version").fetchone()[0]
+            res = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='version'").fetchone()
+            if not res:
+                return 0
+            row = self.conn.execute("SELECT number FROM version").fetchone()
+            return row[0] if row else 0
 
     def _set_version_impl(self, value):
         with self.conn:
-            return self.conn.execute("UPDATE version SET number = ?", (value,))
+            res = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='version'").fetchone()
+            if not res:
+                self.conn.execute("CREATE TABLE version (number INTEGER);")
+                self.conn.execute("INSERT INTO version VALUES (?)", (value,))
+            else:
+                self.conn.execute("UPDATE version SET number = ?", (value,))
 
     async def dc_id(self, value: int = object):
         return await self._accessor(value)
